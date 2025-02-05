@@ -8,7 +8,7 @@ import re
 import time
 from pathlib import Path
 
-from PIL import Image, ImageDraw, UnidentifiedImageError
+from PIL import Image, ImageDraw, UnidentifiedImageError, ImageFont
 
 import homeassistant.helpers.config_validation as cv
 import homeassistant.util.dt as dt_util
@@ -34,6 +34,7 @@ _LOGGER = logging.getLogger(__name__)
 CONF_REGION = "region_name"
 CONF_ACCESS_KEY_ID = "aws_access_key_id"
 CONF_SECRET_ACCESS_KEY = "aws_secret_access_key"
+CONF_COLLECTION_ID = "collection_id"
 
 DEFAULT_REGION = "us-east-1"
 SUPPORTED_REGIONS = [
@@ -57,7 +58,7 @@ SUPPORTED_REGIONS = [
 CONF_BOTO_RETRIES = "boto_retries"
 CONF_SAVE_FILE_FORMAT = "save_file_format"
 CONF_SAVE_FILE_FOLDER = "save_file_folder"
-CONF_SAVE_TIMESTAMPTED_FILE = "save_timestamped_file"
+CONF_SAVE_TIMESTAMPED_FILE = "save_timestamped_file"
 CONF_ALWAYS_SAVE_LATEST_FILE = "always_save_latest_file"
 CONF_SHOW_BOXES = "show_boxes"
 CONF_SCALE = "scale"
@@ -78,7 +79,7 @@ DEFAULT_ROI_Y_MIN = 0.0
 DEFAULT_ROI_Y_MAX = 1.0
 DEFAULT_ROI_X_MIN = 0.0
 DEFAULT_ROI_X_MAX = 1.0
-DEAULT_SCALE = 1.0
+DEFAULT_SCALE = 1.0
 DEFAULT_ROI = (
     DEFAULT_ROI_Y_MIN,
     DEFAULT_ROI_X_MIN,
@@ -123,18 +124,20 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_ROI_X_MIN, default=DEFAULT_ROI_X_MIN): cv.small_float,
         vol.Optional(CONF_ROI_Y_MAX, default=DEFAULT_ROI_Y_MAX): cv.small_float,
         vol.Optional(CONF_ROI_X_MAX, default=DEFAULT_ROI_X_MAX): cv.small_float,
-        vol.Optional(CONF_SCALE, default=DEAULT_SCALE): vol.All(
-            vol.Coerce(float, vol.Range(min=0.1, max=1))
+        vol.Optional(CONF_SCALE, default=DEFAULT_SCALE): vol.All(
+            vol.Coerce(float), vol.Range(min=0.1, max=1)
         ),
         vol.Optional(CONF_SAVE_FILE_FOLDER): cv.isdir,
         vol.Optional(CONF_SAVE_FILE_FORMAT, default=JPG): vol.In([JPG, PNG]),
-        vol.Optional(CONF_SAVE_TIMESTAMPTED_FILE, default=False): cv.boolean,
+        vol.Optional(CONF_SAVE_TIMESTAMPED_FILE, default=False): cv.boolean,
         vol.Optional(CONF_ALWAYS_SAVE_LATEST_FILE, default=False): cv.boolean,
         vol.Optional(CONF_S3_BUCKET): cv.string,
         vol.Optional(CONF_SHOW_BOXES, default=True): cv.boolean,
         vol.Optional(CONF_BOTO_RETRIES, default=DEFAULT_BOTO_RETRIES): vol.All(
             vol.Coerce(int), vol.Range(min=0)
         ),
+        # ✅ Aggiunta di collection_id
+        vol.Optional(CONF_COLLECTION_ID): cv.string,
     }
 )
 
@@ -158,6 +161,8 @@ def object_in_roi(roi: dict, centroid: dict) -> bool:
 
 
 def get_objects(response: str) -> dict:
+    _LOGGER.debug("get_objects received response: %s", response)
+    _LOGGER.debug("modifica apporartata.")
     """Parse the data, returning detected objects only."""
     objects = []
     labels = []
@@ -220,10 +225,10 @@ def get_valid_filename(name: str) -> str:
 
 def setup_platform(hass, config, add_devices, discovery_info=None):
     """Set up ObjectDetection."""
-
+    collection_id = config.get(CONF_COLLECTION_ID)
     import boto3
 
-    _LOGGER.debug("boto_retries setting is {}".format(config[CONF_BOTO_RETRIES]))
+    _LOGGER.debug("boto_retries setting is %s", config[CONF_BOTO_RETRIES])
 
     aws_config = {
         CONF_REGION: config[CONF_REGION],
@@ -233,26 +238,24 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
 
     retries = 0
     success = False
+    rekognition_client = None
+
     while retries <= config[CONF_BOTO_RETRIES]:
         try:
             rekognition_client = boto3.client("rekognition", **aws_config)
             success = True
             break
-        except KeyError:
-            _LOGGER.info("boto3 client failed, retries={}".format(retries))
+        except Exception as e:
+            _LOGGER.warning("boto3 client failed, retry {}/{}: {}".format(retries, config[CONF_BOTO_RETRIES], e))
             retries += 1
             time.sleep(1)
 
     if not success:
         raise Exception(
-            "Failed to create boto3 client. Maybe try increasing "
-            "the boto_retries setting. Retry counter was {}".format(retries)
+            "Failed to create boto3 client. Increase boto_retries setting. Retries: {}".format(retries)
         )
 
-    if config.get(CONF_S3_BUCKET):
-        s3_client = boto3.client("s3", **aws_config)
-    else:
-        s3_client = None
+    s3_client = boto3.client("s3", **aws_config) if CONF_S3_BUCKET in config else None
 
     save_file_folder = config.get(CONF_SAVE_FILE_FOLDER)
     if save_file_folder:
@@ -275,11 +278,12 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
                 show_boxes=config[CONF_SHOW_BOXES],
                 save_file_format=config[CONF_SAVE_FILE_FORMAT],
                 save_file_folder=save_file_folder,
-                save_timestamped_file=config.get(CONF_SAVE_TIMESTAMPTED_FILE),
+                save_timestamped_file=config.get(CONF_SAVE_TIMESTAMPED_FILE),  # Corretto
                 always_save_latest_file=config.get(CONF_ALWAYS_SAVE_LATEST_FILE),
                 s3_bucket=config.get(CONF_S3_BUCKET),
                 camera_entity=camera.get(CONF_ENTITY_ID),
                 name=camera.get(CONF_NAME),
+                collection_id=collection_id,
             )
         )
     add_devices(entities)
@@ -308,8 +312,11 @@ class ObjectDetection(ImageProcessingEntity):
         s3_bucket,
         camera_entity,
         name=None,
+        collection_id=None,
+        
     ):
         """Init with the client."""
+        self._collection_id = collection_id
         self._aws_rekognition_client = rekognition_client
         self._aws_s3_client = s3_client
         self._aws_region = region
@@ -354,11 +361,12 @@ class ObjectDetection(ImageProcessingEntity):
 
     def process_image(self, image):
         """Process an image."""
+        self._faces = [] 
         self._image = Image.open(io.BytesIO(bytearray(image)))  # used for saving only
         self._image_width, self._image_height = self._image.size
 
-        # resize image if different then default
-        if self._scale != DEAULT_SCALE:
+        # Resize image se necessario
+        if self._scale != DEFAULT_SCALE:
             newsize = (self._image_width * self._scale, self._image_width * self._scale)
             self._image.thumbnail(newsize, Image.ANTIALIAS)
             self._image_width, self._image_height = self._image.size
@@ -366,9 +374,7 @@ class ObjectDetection(ImageProcessingEntity):
                 self._image.save(output, format="JPEG")
                 image = output.getvalue()
             _LOGGER.debug(
-                (
-                    f"Image scaled with : {self._scale} W={self._image_width} H={self._image_height}"
-                )
+                f"Image scaled with : {self._scale} W={self._image_width} H={self._image_height}"
             )
 
         self._state = None
@@ -378,53 +384,83 @@ class ObjectDetection(ImageProcessingEntity):
         self._summary = {target: 0 for target in self._targets_names}
         saved_image_path = None
 
-        response = self._aws_rekognition_client.detect_labels(Image={"Bytes": image})
-        self._objects, self._labels = get_objects(response)
+        # 🔹 1. Rilevamento oggetti per ottenere "Person"
+        response_labels = self._aws_rekognition_client.detect_labels(Image={"Bytes": image})
+        _LOGGER.debug("Rekognition detect_labels response: %s", response_labels)
+
+        self._objects, self._labels = get_objects(response_labels)
+        _LOGGER.debug("Parsed objects: %s", self._objects)
+        _LOGGER.debug("Parsed labels: %s", self._labels)
+
+        # 🔹 Resettiamo sempre le liste
         self._targets_found = []
 
+        # 🔹 Manteniamo tutti gli oggetti nel sensore
         for obj in self._objects:
-            if not ((obj["name"] in self._targets_names)):
-                continue
-            ## Then if a confidence for a named object, this takes precedence over type confidence
-            confidence = None
-            for target in self._targets:
-                if obj["name"] == target[CONF_TARGET]:
-                    confidence = target[CONF_CONFIDENCE]
-            if obj["confidence"] > confidence:
-                if not object_in_roi(self._roi_dict, obj["centroid"]):
-                    continue
+            if obj["confidence"] >= MIN_CONFIDENCE:
                 self._targets_found.append(obj)
 
+        # 🔹 Stato aggiornato con il numero totale di oggetti trovati
         self._state = len(self._targets_found)
 
-        if self._state > 0:
-            self._last_detection = dt_util.now().strftime(DATETIME_FORMAT)
+        # 🔹 Controlla se almeno una persona è stata rilevata
+        found_person = any(obj["name"] == "person" and obj["confidence"] >= MIN_CONFIDENCE for obj in self._objects)
 
-        targets_found = [
-            obj["name"] for obj in self._targets_found
-        ]  # Just the list of target names, e.g. [car, car, person]
-        self._summary = dict(Counter(targets_found))  # e.g. {'car':2, 'person':1}
-        for target in self._targets_names:
-            if target not in self._summary.keys():
-                self._summary.update({target: 0})
-
-        if self._save_file_folder:
-            if self._state > 0 or self._always_save_latest_file:
-                saved_image_path = self.save_image(
-                    self._targets_found, self._save_file_folder,
+        # 🔹 2. Rilevamento volti e confronto con la collection di Rekognition
+        if found_person and self._collection_id:
+            try:
+                response_faces = self._aws_rekognition_client.search_faces_by_image(
+                    CollectionId=self._collection_id,
+                    Image={"Bytes": image},
+                    MaxFaces=5,
+                    FaceMatchThreshold=80
                 )
+                _LOGGER.debug("Rekognition search_faces_by_image response: %s", response_faces)
 
-        # Fire events
+                self._faces = []  # 🔹 Assicura che l'elenco venga sempre aggiornato
+
+                for match in response_faces.get("FaceMatches", []):
+                    face = {
+                        "name": match["Face"]["ExternalImageId"],
+                        "confidence": round(match["Similarity"], 2),
+                    }
+                    self._faces.append(face)
+
+                # 🔹 Se nessun volto viene rilevato, assicura che venga aggiornato a lista vuota
+                if not self._faces:
+                    _LOGGER.debug("Nessun volto riconosciuto, aggiornamento sensore con lista vuota.")
+            except botocore.exceptions.ClientError as error:
+                _LOGGER.error(f"Error in search_faces_by_image: {error}")
+
+        # 🔹 Aggiorna il summary
+        targets_found_names = [obj["name"] for obj in self._targets_found]
+        self._summary = dict(Counter(targets_found_names))
+
+        # 🔹 Aggiungi i volti riconosciuti nel summary
+        for face in self._faces:
+            self._summary[face["name"]] = self._summary.get(face["name"], 0) + 1
+
+        if self._save_file_folder and (self._state > 0 or self._always_save_latest_file):
+            saved_image_path = self.save_image(self._targets_found, self._save_file_folder)
+
+        # 🔹 Fire events per oggetti rilevati
         for target in self._targets_found:
             target_event_data = target.copy()
             target_event_data[ATTR_ENTITY_ID] = self.entity_id
             if saved_image_path:
                 target_event_data[SAVED_FILE] = saved_image_path
             self.hass.bus.fire(EVENT_OBJECT_DETECTED, target_event_data)
-        for label in self._labels:
-            label_event_data = label.copy()
-            label_event_data[ATTR_ENTITY_ID] = self.entity_id
-            self.hass.bus.fire(EVENT_LABEL_DETECTED, label_event_data)
+
+        # 🔹 Fire events per volti riconosciuti
+        for face in self._faces:
+            face_event_data = face.copy()
+            face_event_data[ATTR_ENTITY_ID] = self.entity_id
+            if saved_image_path:
+                face_event_data[SAVED_FILE] = saved_image_path
+            self.hass.bus.fire("rekognition.face_detected", face_event_data)
+
+
+
 
     @property
     def camera_entity(self):
@@ -455,86 +491,127 @@ class ObjectDetection(ImageProcessingEntity):
     def extra_state_attributes(self):
         """Return device specific state attributes."""
         attr = {}
+        
+        # Volti riconosciuti
+        if hasattr(self, "_faces"):
+            attr["recognized_faces"] = self._faces  # Lista dei volti riconosciuti con nome e confidenza
+        
+        # Targets rilevati
         attr["targets"] = self._targets
         attr["targets_found"] = [
             {obj["name"]: obj["confidence"]} for obj in self._targets_found
         ]
+        
+        # Riassunto rilevamenti
         attr["summary"] = self._summary
+        
         if self._last_detection:
             attr["last_target_detection"] = self._last_detection
+        
         attr["all_objects"] = [
             {obj["name"]: obj["confidence"]} for obj in self._objects
         ]
+        
+        # Parametri di salvataggio
         if self._save_file_folder:
             attr[CONF_SAVE_FILE_FORMAT] = self._save_file_format
             attr[CONF_SAVE_FILE_FOLDER] = str(self._save_file_folder)
-            attr[CONF_SAVE_TIMESTAMPTED_FILE] = self._save_timestamped_file
+            attr[CONF_SAVE_TIMESTAMPED_FILE] = self._save_timestamped_file
             attr[CONF_ALWAYS_SAVE_LATEST_FILE] = self._always_save_latest_file
             attr[CONF_SHOW_BOXES] = self._show_boxes
+        
+        # Se è configurato il bucket S3
         if self._s3_bucket:
             attr[CONF_S3_BUCKET] = self._s3_bucket
+        
+        # Etichette rilevate
         attr["labels"] = self._labels
+        
         return attr
 
-    def save_image(self, targets, directory) -> str:
-        """Draws the actual bounding box of the detected objects.
 
-        Returns: saved_image_path, which is the path to the saved timestamped file if configured, else the default saved image.
-        """
+    def save_image(self, targets, directory) -> str:
+        """Draw bounding boxes for detected objects and recognized faces, then save the image."""
         try:
             img = self._image.convert("RGB")
         except UnidentifiedImageError:
             _LOGGER.warning("Rekognition unable to process image, bad data")
-            return
+            return None
+
         draw = ImageDraw.Draw(img)
 
-        roi_tuple = tuple(self._roi_dict.values())
-        if roi_tuple != DEFAULT_ROI and self._show_boxes:
-            draw_box(
-                draw, roi_tuple, img.width, img.height, text="ROI", color=GREEN,
-            )
+        # Carica un font leggibile
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/trfype/dejavu/DejaVuSans-Bold.ttf", 16)
+        except IOError:
+            font = ImageFont.load_default()
 
+        # 🔹 Crea una mappa per abbinare i volti riconosciuti alle persone
+        face_map = {}
+        for face in self._faces:
+            face_map[face["name"]] = face["confidence"]
+
+        # 🔹 Disegna bounding box per le persone
         for obj in targets:
-            if not self._show_boxes:
-                break
-            name = obj["name"]
-            confidence = obj["confidence"]
-            box = obj["bounding_box"]
-            centroid = obj["centroid"]
-            box_label = f"{name}: {confidence:.1f}%"
+            if obj["name"] == "person":
+                box = obj["bounding_box"]
+                confidence = obj["confidence"]
+                name_label = f"person: {confidence:.1f}%"
 
-            draw_box(
-                draw,
-                (box["y_min"], box["x_min"], box["y_max"], box["x_max"]),
-                img.width,
-                img.height,
-                text=box_label,
-                color=RED,
-            )
+                # 🔹 Se il volto è stato riconosciuto, aggiunge il nome
+                for face_name, face_conf in face_map.items():
+                    name_label = f"{face_name}: {face_conf:.1f}%"
 
-            # draw bullseye
-            draw.text(
-                (centroid["x"] * img.width, centroid["y"] * img.height),
-                text="X",
-                fill=RED,
-            )
+                # 🔹 Disegna bounding box della persona in rosso
+                draw.rectangle(
+                    [
+                        (box["x_min"] * img.width, box["y_min"] * img.height),
+                        (box["x_max"] * img.width, box["y_max"] * img.height),
+                    ],
+                    outline=RED,
+                    width=3,
+                )
 
+                # 🔹 Aggiunge il testo sopra la persona
+                draw.text(
+                    (box["x_min"] * img.width, box["y_min"] * img.height - 10),
+                    name_label,
+                    fill="white",
+                    font=font,
+                )
+
+        # 🔹 Disegna bounding box dei volti riconosciuti in giallo
+        for face in self._faces:
+            if "bounding_box" in face:
+                box = face["bounding_box"]
+                name = face["name"]
+                confidence = face["confidence"]
+                label = f"{name}: {confidence:.1f}%"
+
+                draw.rectangle(
+                    [
+                        (box["x_min"] * img.width, box["y_min"] * img.height),
+                        (box["x_max"] * img.width, box["y_max"] * img.height),
+                    ],
+                    outline=YELLOW,
+                    width=2,
+                )
+
+                draw.text(
+                    (box["x_min"] * img.width, box["y_min"] * img.height - 10),
+                    label,
+                    fill="yellow",
+                    font=font,
+                )
+
+        # 🔹 Salvataggio immagine
         latest_save_path = (
             directory / f"{get_valid_filename(self._name).lower()}_latest.{self._save_file_format}"
         )
         img.save(latest_save_path)
         _LOGGER.info("Rekognition saved file %s", latest_save_path)
-        saved_image_path = latest_save_path
+        
+        return str(latest_save_path)
 
-        if targets and self._save_timestamped_file:
-            filename = f"{self._name}_{self._last_detection}.{self._save_file_format}"
-            timestamp_save_path = directory / filename
-            img.save(timestamp_save_path)
-            _LOGGER.info("Rekognition saved file %s", timestamp_save_path)
-            if self._s3_bucket:
-                self._aws_s3_client.upload_file(Filename=str(timestamp_save_path), Bucket=self._s3_bucket, Key=filename)
-                _LOGGER.info(
-                    f"Uploaded file {filename} to S3"
-                )
-            return str(timestamp_save_path)
-        return str(saved_image_path)
+
+
